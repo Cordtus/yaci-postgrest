@@ -7,6 +7,7 @@ app = 'yaci-postgrest'
 primary_region = 'sjc'
 
 [build]
+  dockerfile = "docker/Dockerfile"
 
 [env]
   PGRST_DB_ANON_ROLE = 'web_anon'
