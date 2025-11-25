@@ -250,13 +250,7 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 			}
 		}
 
-		// Delete successfully processed transactions from pending queue
-		await client.query(
-			`DELETE FROM api.evm_pending_decode
-       WHERE tx_id = ANY($1)`,
-			[pending.rows.map(r => r.tx_id)]
-		)
-
+		// View automatically excludes processed txs via NOT EXISTS clause
 		await client.query('COMMIT')
 		console.log(`✓ Decoded ${pending.rows.length} transactions`)
 		return pending.rows.length
