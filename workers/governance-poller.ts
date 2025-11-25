@@ -231,25 +231,23 @@ class GovernancePoller {
 }
 
 // Start worker if run directly
-if (require.main === module) {
-  const poller = new GovernancePoller()
+const poller = new GovernancePoller()
 
-  process.on('SIGINT', async () => {
-    console.log('\n[Governance Poller] Received SIGINT')
-    await poller.stop()
-    process.exit(0)
-  })
+process.on('SIGINT', async () => {
+  console.log('\n[Governance Poller] Received SIGINT')
+  await poller.stop()
+  process.exit(0)
+})
 
-  process.on('SIGTERM', async () => {
-    console.log('\n[Governance Poller] Received SIGTERM')
-    await poller.stop()
-    process.exit(0)
-  })
+process.on('SIGTERM', async () => {
+  console.log('\n[Governance Poller] Received SIGTERM')
+  await poller.stop()
+  process.exit(0)
+})
 
-  poller.start().catch((error) => {
-    console.error('[Governance Poller] Fatal error:', error)
-    process.exit(1)
-  })
-}
+poller.start().catch((error) => {
+  console.error('[Governance Poller] Fatal error:', error)
+  process.exit(1)
+})
 
 export default GovernancePoller
