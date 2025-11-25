@@ -135,3 +135,34 @@ export interface BlockRaw {
 		}
 	}
 }
+
+// Governance
+
+export interface GovernanceProposal {
+	proposal_id: number
+	title: string | null
+	summary: string | null
+	status: string
+	submit_time: string
+	deposit_end_time: string | null
+	voting_start_time: string | null
+	voting_end_time: string | null
+	proposer: string | null
+	tally: {
+		yes: string | null
+		no: string | null
+		abstain: string | null
+		no_with_veto: string | null
+	}
+	last_updated: string
+}
+
+export interface ProposalSnapshot {
+	proposal_id: number
+	status: string
+	yes_count: string
+	no_count: string
+	abstain_count: string
+	no_with_veto_count: string
+	snapshot_time: string
+}

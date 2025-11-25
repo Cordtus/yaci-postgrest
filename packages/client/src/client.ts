@@ -9,7 +9,9 @@ import type {
 	TransactionDetail,
 	AddressStats,
 	ChainStats,
-	SearchResult
+	SearchResult,
+	GovernanceProposal,
+	ProposalSnapshot
 } from './types'
 
 export interface YaciClientConfig {
@@ -200,6 +202,25 @@ export class YaciClient {
 			success_rate_percent: number
 		}>>('tx_success_rate')
 		return result[0]
+	}
+
+	async getGovernanceProposals(
+		limit = 20,
+		offset = 0,
+		status?: string
+	): Promise<PaginatedResponse<GovernanceProposal>> {
+		return this.rpc('get_governance_proposals', {
+			_limit: limit,
+			_offset: offset,
+			_status: status
+		})
+	}
+
+	async getProposalSnapshots(proposalId: number): Promise<ProposalSnapshot[]> {
+		return this.query('governance_snapshots', {
+			proposal_id: `eq.${proposalId}`,
+			order: 'snapshot_time.desc'
+		})
 	}
 }
 
