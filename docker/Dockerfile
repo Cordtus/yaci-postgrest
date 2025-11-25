@@ -24,8 +24,8 @@ COPY --from=postgrest /bin/postgrest /usr/local/bin/postgrest
 # Copy Node.js app with dependencies
 COPY --from=builder /app /app
 
-# Use tini as entrypoint for proper signal handling
-ENTRYPOINT ["/sbin/tini", "--"]
+# Use tini as entrypoint for proper signal handling (-s for subreaper mode)
+ENTRYPOINT ["/sbin/tini", "-s", "--"]
 
 # Default to PostgREST (overridden by fly.toml for worker process)
 CMD ["/usr/local/bin/postgrest"]
