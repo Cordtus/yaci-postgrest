@@ -40,6 +40,11 @@ interface DecodedLog {
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
   max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  // Enable TCP keepalive to prevent proxy timeouts
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 })
 
 function decodeTransaction(rawBase64: string, txId: string, gasUsed: number | null): DecodedTx | null {
