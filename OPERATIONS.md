@@ -18,12 +18,16 @@ The YACI Explorer stack consists of three specialized components working in conc
 - DO NOT MODIFY - external dependency maintained separately
 
 **2. Middleware Layer** (github.com/Cordtus/yaci-explorer-apis)
-- Dual-process architecture: PostgREST API server + Node.js worker
+- Three-process architecture on Fly.io:
+  - `app`: PostgREST API server (port 3000)
+  - `worker`: EVM decode daemon (batch processing)
+  - `priority_decoder`: Priority EVM decode via NOTIFY/LISTEN
 - PostgREST automatically generates REST API from PostgreSQL schema
 - SQL functions provide complex business logic (pagination, filtering, aggregation)
-- SQL views materialize analytics data (transaction volume, gas usage, message types)
+- Materialized views for analytics data (daily/hourly tx stats, message types)
 - Database triggers parse raw JSON into structured relational tables
-- EVM decode worker continuously monitors and decodes Ethereum-compatible transactions
+- Database triggers extract governance data from indexed MsgSubmitProposal/MsgVote
+- No external API dependencies - all data from indexed gRPC transactions
 - TypeScript client package for type-safe API consumption
 - All business logic lives here - never in frontend or indexer
 
@@ -48,13 +52,24 @@ PostgreSQL api.transactions_raw
     |
     v (Database triggers fire automatically)
 PostgreSQL api.transactions_main/messages_main/events_main
+    |                                          |
+    +---> Governance triggers                  |
+    |     (MsgSubmitProposal/MsgVote)         |
+    |         |                                |
+    |         v                                |
+    |     api.governance_proposals             |
+    |                                          |
+    +---> PostgREST API (HTTP REST) ---------->+---> Frontend (User Interface)
     |
-    +---> PostgREST API (HTTP REST) ---> Frontend (User Interface)
+    +---> EVM Worker (batch daemon)
+    |         |
+    |         v
+    |     api.evm_transactions/evm_logs/evm_token_transfers
     |
-    +---> EVM Worker (Background processing)
-            |
-            v
-        api.evm_transactions/evm_logs/evm_token_transfers
+    +---> Priority Decoder (NOTIFY/LISTEN)
+              |
+              v
+          On-demand EVM decode for tx detail view
 ```
 
 **Detailed Flow:**
@@ -67,15 +82,22 @@ PostgreSQL api.transactions_main/messages_main/events_main
    - update_events_raw: Extracts events array
    - update_message_main: Parses messages with address extraction
    - update_event_main: Normalizes event attributes
-5. PostgREST exposes structured data via auto-generated REST endpoints
-6. EVM worker polls evm_pending_decode view every 5 seconds:
+5. Governance triggers fire on MsgSubmitProposal/MsgVote:
+   - detect_proposal_submission: Extracts proposal data from indexed messages
+   - track_governance_vote: Updates vote tallies from indexed vote messages
+   - No external REST API polling required
+6. PostgREST exposes structured data via auto-generated REST endpoints
+7. EVM worker daemon polls evm_pending_decode view every 5 seconds:
    - Identifies MsgEthereumTx messages not yet decoded
    - RLP decodes transaction data
    - Protobuf decodes response data
    - Lookups function signatures from 4byte.directory
    - Stores in evm_transactions, evm_logs, evm_token_transfers
-7. Frontend queries PostgREST endpoints with TanStack Query
-8. TanStack Query provides automatic caching (10s stale time, 5min garbage collection)
+8. Priority decoder listens for NOTIFY on evm_decode_priority channel:
+   - Triggered when user views transaction detail (get_transaction_detail RPC)
+   - Immediately decodes requested transaction for instant display
+9. Frontend queries PostgREST endpoints with TanStack Query
+10. TanStack Query provides automatic caching (10s stale time, 5min garbage collection)
 
 ## Configuration Reference
 
@@ -122,6 +144,117 @@ VITE_POSTGREST_URL=https://yaci-explorer-apis.fly.dev
 VITE_CHAIN_REST_ENDPOINT=https://rest.example.com  # For IBC denom resolution
 ```
 
+### Database Connection Pooling
+
+**PostgREST Connection Pooling**
+
+PostgREST manages its own internal connection pool to PostgreSQL. Key settings:
+
+```bash
+PGRST_DB_POOL=10              # Max connections in pool (default: 10)
+PGRST_DB_POOL_TIMEOUT=10      # Connection acquisition timeout in seconds (default: 10s)
+PGRST_DB_POOL_ACQUISITION_TIMEOUT=10  # Alternative name for timeout setting
+```
+
+For Fly.io shared-cpu-1x instances, start with conservative settings:
+- PGRST_DB_POOL=5 (leaves headroom for indexer and worker)
+- PGRST_DB_POOL_TIMEOUT=10 (fail fast on contention)
+
+**PgBouncer (Optional)**
+
+Consider adding PgBouncer when:
+- Connection churn is high (many short-lived queries)
+- Multiple middleware instances are scaled horizontally
+- Connection limit errors appear in logs
+
+Basic PgBouncer configuration:
+```ini
+[databases]
+postgres = host=republic-yaci-pg.flycast port=5432 dbname=postgres
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 100
+default_pool_size = 20
+```
+
+**Pool modes:**
+- `transaction`: Connection returned after each transaction (recommended)
+- `session`: Connection held for entire client session (required for prepared statements)
+
+**Fly.io PostgreSQL Connection Limits**
+
+Shared CPU instances have limited connections:
+- shared-cpu-1x: ~25 max connections
+- shared-cpu-2x: ~50 max connections
+- dedicated-cpu-1x: ~100 max connections
+
+Calculate your connection budget:
+```
+Total = (PostgREST pool * instances) + indexer + worker + admin
+Example: (5 * 2) + 3 + 1 + 2 = 17 connections
+```
+
+Check current connection usage:
+```sql
+SELECT count(*) FROM pg_stat_activity WHERE datname = 'postgres';
+```
+
+Recommended settings for shared-cpu-1x (25 connection limit):
+```bash
+# Middleware (2 instances)
+PGRST_DB_POOL=5              # 10 connections total
+
+# Indexer
+YACI_MAX_CONNECTIONS=3       # 3 connections
+
+# Worker
+DATABASE_POOL_SIZE=1         # 1 connection
+
+# Total: 14 connections (11 remaining for admin/monitoring)
+```
+
+**Monitoring Connection Usage**
+
+Track connections by application:
+```sql
+SELECT application_name, count(*)
+FROM pg_stat_activity
+WHERE datname = 'postgres'
+GROUP BY application_name;
+```
+
+Monitor connection states:
+```sql
+SELECT state, count(*)
+FROM pg_stat_activity
+GROUP BY state;
+```
+
+Check for idle connections consuming pool:
+```sql
+SELECT
+  pid,
+  usename,
+  application_name,
+  state,
+  state_change,
+  NOW() - state_change as idle_duration
+FROM pg_stat_activity
+WHERE state = 'idle'
+  AND datname = 'postgres'
+ORDER BY state_change;
+```
+
+Terminate long-idle connections if needed:
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle'
+  AND state_change < NOW() - INTERVAL '10 minutes'
+  AND datname = 'postgres';
+```
+
 ### Database Schema Architecture
 
 **Raw Storage Tables (written by Yaci):**
@@ -141,12 +274,23 @@ VITE_CHAIN_REST_ENDPOINT=https://rest.example.com  # For IBC denom resolution
 - `api.evm_token_transfers`: Parsed ERC-20/721 transfers
 - `api.evm_tokens`: Token metadata cache
 
-**Analytics Views:**
+**Analytics Views and Materialized Views:**
+- `api.mv_daily_tx_stats`: Daily transaction counts, success/fail, unique senders (materialized)
+- `api.mv_hourly_tx_stats`: Hourly transaction counts for last 7 days (materialized)
+- `api.mv_message_type_stats`: Message type distribution with percentages (materialized)
 - `api.tx_volume_daily/hourly`: Transaction counts aggregated by time
 - `api.message_type_stats`: Message type distribution
-- `api.gas_usage_distribution`: Gas usage buckets
-- `api.fee_revenue`: Fee collection over time
 - `api.evm_pending_decode`: View of EVM transactions awaiting decode
+- `api.query_stats`: pg_stat_statements wrapper for performance monitoring
+
+**Governance Tables:**
+- `api.governance_proposals`: Proposals detected from indexed MsgSubmitProposal
+- `api.governance_snapshots`: Historical proposal state snapshots
+
+**Refresh Materialized Views:**
+```sql
+SELECT api.refresh_analytics_views();
+```
 
 ### Security Model
 
@@ -241,9 +385,9 @@ fly secrets set \
 # Deploy with fly.toml configuration
 fly deploy -a yaci-explorer-apis
 
-# Verify both processes started
+# Verify all three processes started
 fly status -a yaci-explorer-apis
-# Should show: 1 app process + 1 worker process
+# Should show: 1 app process + 1 worker process + 1 priority_decoder process
 
 # Test API
 curl https://yaci-explorer-apis.fly.dev/
@@ -433,6 +577,14 @@ SELECT
   (SELECT COUNT(*) FROM api.evm_transactions) as decoded;
 "
 
+# Check governance proposals
+fly postgres connect -a republic-yaci-pg -c "
+SELECT proposal_id, title, status, last_updated
+FROM api.governance_proposals
+ORDER BY proposal_id DESC
+LIMIT 10;
+"
+
 # Check worker logs
 fly logs -a yaci-explorer-apis --instance=<worker-id>
 
@@ -525,6 +677,434 @@ FROM pg_stat_user_indexes
 WHERE schemaname = 'api'
 ORDER BY idx_scan;
 "
+```
+
+### Backup and Recovery Procedures
+
+**Overview:**
+Fly.io provides automated daily backups for managed PostgreSQL instances. For blockchain data specifically, re-indexing from the chain is always an option, making traditional backups less critical than for other data types. However, backups significantly reduce recovery time and preserve computed analytics.
+
+#### Fly.io Managed Backups
+
+Fly.io automatically creates daily snapshots of your PostgreSQL database. These backups are stored redundantly and can be restored with simple commands.
+
+**List Available Backups:**
+```bash
+# View all backups with timestamps and sizes
+fly postgres backup list -a republic-yaci-pg
+
+# Output shows:
+# ID    CREATED AT           SIZE
+# 12345 2024-01-15 03:00:00  2.5 GB
+# 12344 2024-01-14 03:00:00  2.4 GB
+```
+
+**Restore from Backup:**
+```bash
+# Restore specific backup to existing database
+fly postgres backup restore 12345 -a republic-yaci-pg
+
+# WARNING: This will stop the database and restore the backup
+# All connected applications will be disconnected temporarily
+```
+
+**Retention Policies:**
+- Daily backups retained for 7 days (default Fly.io policy)
+- For custom retention, consider paid Fly.io plans
+- Backups are stored in same region as database
+
+**Before Restoring:**
+1. Stop the indexer to prevent write conflicts
+2. Notify users of planned downtime
+3. Document current database state (latest block height)
+4. Verify backup timestamp matches intended recovery point
+
+#### Manual Backup Procedures
+
+Manual backups provide additional control and allow local storage for compliance or disaster recovery scenarios.
+
+**Create Manual Snapshot:**
+```bash
+# Trigger on-demand backup
+fly postgres backup create -a republic-yaci-pg
+
+# Use for:
+# - Before major migrations
+# - Before schema changes
+# - Before bulk data operations
+# - Weekly/monthly archival
+```
+
+**Export to Local File:**
+```bash
+# Step 1: Create proxy tunnel to database
+fly proxy 15433:5432 -a republic-yaci-pg &
+PROXY_PID=$!
+
+# Step 2: Export using pg_dump
+pg_dump "postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --format=custom \
+  --compress=9 \
+  --file=backup_$(date +%Y%m%d_%H%M%S).dump
+
+# Step 3: Stop proxy
+kill $PROXY_PID
+
+# Format options:
+# --format=custom: Binary format, best for pg_restore
+# --format=plain: SQL text, human-readable
+# --compress=9: Maximum compression
+```
+
+**Export Specific Schema Only:**
+```bash
+# Backup only api schema (production data)
+pg_dump "postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --schema=api \
+  --format=custom \
+  --file=api_schema_backup.dump
+
+# Export as SQL for version control
+pg_dump "postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --schema-only \
+  --schema=api \
+  --file=api_schema_$(date +%Y%m%d).sql
+```
+
+**Export Specific Tables:**
+```bash
+# Backup only governance data (lightweight)
+pg_dump "postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --table=api.governance_proposals \
+  --table=api.governance_snapshots \
+  --format=custom \
+  --file=governance_backup.dump
+
+# Backup raw tables (largest data)
+pg_dump "postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --table=api.blocks_raw \
+  --table=api.transactions_raw \
+  --format=custom \
+  --file=raw_data_backup.dump
+```
+
+#### Point-in-Time Recovery (PITR)
+
+PITR allows recovery to any specific timestamp by replaying Write-Ahead Log (WAL) files. This is advanced functionality requiring continuous WAL archiving.
+
+**When PITR Matters:**
+- Production mainnet deployments with financial data
+- Compliance requirements for data auditability
+- Scenarios where re-indexing would take days/weeks
+- When exact transaction ordering is critical
+
+**When PITR Doesn't Matter:**
+- Development/testnet environments that reset frequently
+- Networks where re-indexing from chain takes <24 hours
+- Non-financial data where approximation is acceptable
+
+**Enable WAL Archiving (if needed):**
+```bash
+# Note: Fly.io managed Postgres may have limited PITR support
+# Check current WAL settings
+fly postgres connect -a republic-yaci-pg -c "SHOW wal_level;"
+fly postgres connect -a republic-yaci-pg -c "SHOW archive_mode;"
+
+# For self-managed instances, enable archiving:
+# Edit postgresql.conf:
+# wal_level = replica
+# archive_mode = on
+# archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+
+# Fly.io users: Contact support for advanced PITR configuration
+```
+
+#### Disaster Recovery Scenarios
+
+**Scenario A: Database Corruption**
+
+*Symptom:* PostgreSQL won't start, or reports corruption errors in logs
+
+*Recovery Steps:*
+```bash
+# Step 1: Stop all connected services
+fly machine stop <indexer-id> -a republic-yaci-indexer
+fly machine stop <middleware-id> -a yaci-explorer-apis
+
+# Step 2: Identify last good backup
+fly postgres backup list -a republic-yaci-pg
+
+# Step 3: Restore from backup
+fly postgres backup restore <backup-id> -a republic-yaci-pg
+
+# Step 4: Verify database integrity
+fly postgres connect -a republic-yaci-pg -c "
+SELECT COUNT(*) FROM api.blocks_raw;
+SELECT MAX(id) as latest_block FROM api.blocks_raw;
+"
+
+# Step 5: Restart services
+fly machine start <indexer-id> -a republic-yaci-indexer
+fly machine start <middleware-id> -a yaci-explorer-apis
+
+# Step 6: Monitor indexer catching up
+fly logs -a republic-yaci-indexer
+```
+
+*Expected Downtime:* 15-30 minutes depending on backup size
+
+**Scenario B: Accidental Data Deletion**
+
+*Symptom:* Critical data was deleted (e.g., `DELETE FROM api.transactions_main WHERE ...`)
+
+*Recovery Steps:*
+```bash
+# Option 1: Restore specific table from backup
+fly proxy 15433:5432 -a republic-yaci-pg &
+
+# Restore only affected table
+pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --table=api.transactions_main \
+  --clean \
+  backup.dump
+
+# Option 2: Restore to temporary database, copy data over
+createdb temp_restore
+pg_restore --dbname=temp_restore backup.dump
+
+# Copy missing data
+psql -c "INSERT INTO api.transactions_main
+         SELECT * FROM temp_restore.api.transactions_main
+         WHERE id NOT IN (SELECT id FROM api.transactions_main);"
+```
+
+*Expected Downtime:* 5-15 minutes (no service interruption)
+
+**Scenario C: Complete Infrastructure Failure**
+
+*Symptom:* Fly.io region outage, complete data loss, need to rebuild from scratch
+
+*Recovery Steps:*
+```bash
+# Step 1: Create new PostgreSQL instance in different region
+fly postgres create republic-yaci-pg-recovery \
+  --region ord \
+  --vm-size shared-cpu-1x \
+  --volume-size 10
+
+# Step 2: Restore from local backup if available
+fly proxy 15433:5432 -a republic-yaci-pg-recovery &
+pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --jobs=4 \
+  backup.dump
+
+# Step 3: Apply any migrations since backup
+cat migrations/*.sql | fly postgres connect -a republic-yaci-pg-recovery
+
+# Step 4: Update middleware secrets
+fly secrets set \
+  DATABASE_URL="postgres://postgres:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
+  PGRST_DB_URI="postgres://authenticator:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
+  -a yaci-explorer-apis
+
+# Step 5: Update indexer secret
+fly secrets set \
+  YACI_POSTGRES_DSN="postgres://yaci_writer:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
+  -a republic-yaci-indexer
+
+# Step 6: Restart all services
+fly machine restart <indexer-id> -a republic-yaci-indexer
+fly machine restart <middleware-id> -a yaci-explorer-apis
+
+# Step 7: If no backup available, proceed to re-indexing (see below)
+```
+
+*Expected Downtime:* 1-2 hours with backup, 12-48 hours without (re-indexing)
+
+#### Recovery Testing
+
+Regular recovery testing validates backup integrity and documents procedures.
+
+**Monthly Recovery Test:**
+```bash
+# Step 1: Create test database
+fly postgres create republic-yaci-pg-test \
+  --region sjc \
+  --vm-size shared-cpu-1x \
+  --volume-size 5
+
+# Step 2: Restore latest backup to test instance
+fly postgres backup list -a republic-yaci-pg
+fly proxy 15433:5432 -a republic-yaci-pg-test &
+
+pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
+  --jobs=4 \
+  production_backup.dump
+
+# Step 3: Run validation queries
+fly postgres connect -a republic-yaci-pg-test -c "
+SELECT
+  (SELECT COUNT(*) FROM api.blocks_raw) as blocks,
+  (SELECT COUNT(*) FROM api.transactions_main) as transactions,
+  (SELECT MAX(id) FROM api.blocks_raw) as latest_block;
+"
+
+# Step 4: Test API connectivity
+export PGRST_DB_URI="postgres://authenticator:PASSWORD@republic-yaci-pg-test.flycast:5432/postgres"
+postgrest &
+curl http://localhost:3000/transactions_main?limit=10
+
+# Step 5: Document results
+echo "Recovery Test $(date): SUCCESS - Restored ${BLOCK_COUNT} blocks in ${DURATION}s" >> recovery_tests.log
+
+# Step 6: Clean up test resources
+fly postgres destroy republic-yaci-pg-test
+```
+
+**Test Frequency Recommendations:**
+- Monthly: Full database restore to test instance
+- Quarterly: Complete disaster recovery drill
+- After major schema changes: Immediate backup and test restore
+
+#### Data Re-indexing as Alternative
+
+For blockchain data, re-indexing from the chain source is always possible and often preferable to backup restoration.
+
+**When to Re-index vs Restore:**
+
+*Restore from Backup When:*
+- Recovery time is critical (minutes vs hours)
+- Backup is recent (within last 24 hours)
+- Need to preserve computed analytics and materialized views
+- Database includes non-blockchain data (governance snapshots, etc.)
+
+*Re-index from Chain When:*
+- Backup is stale (>7 days old)
+- Schema changed significantly since backup
+- Want to validate data integrity from source
+- Backup file is corrupted or missing
+- Testing indexer improvements/bug fixes
+
+**Re-indexing Steps:**
+
+```bash
+# Step 1: Stop indexer
+fly machine stop <indexer-id> -a republic-yaci-indexer
+
+# Step 2: Truncate all data tables
+fly postgres connect -a republic-yaci-pg -c "
+BEGIN;
+
+-- Raw data tables
+TRUNCATE api.blocks_raw CASCADE;
+TRUNCATE api.transactions_raw CASCADE;
+
+-- Parsed tables (CASCADE will handle these, but explicit for clarity)
+TRUNCATE api.transactions_main CASCADE;
+TRUNCATE api.messages_main CASCADE;
+TRUNCATE api.events_main CASCADE;
+
+-- EVM tables
+TRUNCATE api.evm_transactions CASCADE;
+TRUNCATE api.evm_logs CASCADE;
+TRUNCATE api.evm_token_transfers CASCADE;
+TRUNCATE api.evm_tokens CASCADE;
+
+-- Governance tables
+TRUNCATE api.governance_proposals CASCADE;
+TRUNCATE api.governance_snapshots CASCADE;
+
+-- Refresh materialized views (will be empty)
+REFRESH MATERIALIZED VIEW api.mv_daily_tx_stats;
+REFRESH MATERIALIZED VIEW api.mv_hourly_tx_stats;
+REFRESH MATERIALIZED VIEW api.mv_message_type_stats;
+
+COMMIT;
+"
+
+# Step 3: Verify clean state
+fly postgres connect -a republic-yaci-pg -c "
+SELECT
+  (SELECT COUNT(*) FROM api.blocks_raw) as blocks,
+  (SELECT COUNT(*) FROM api.transactions_raw) as txs,
+  (SELECT COUNT(*) FROM api.governance_proposals) as proposals;
+"
+# Should return 0, 0, 0
+
+# Step 4: Optionally override start height
+# Default: Indexer resumes from MAX(id), which will be 0
+# Override to start from specific block:
+fly secrets set YACI_START=1000000 -a republic-yaci-indexer
+
+# Step 5: Start indexer
+fly machine start <indexer-id> -a republic-yaci-indexer
+
+# Step 6: Monitor progress
+fly logs -a republic-yaci-indexer -f
+
+# Step 7: Check progress periodically
+watch -n 30 'fly postgres connect -a republic-yaci-pg -c "
+SELECT
+  MAX(id) as current_block,
+  COUNT(*) as total_blocks,
+  MAX(data->>\"time\") as latest_time
+FROM api.blocks_raw;
+"'
+```
+
+**Re-indexing Performance Estimates:**
+
+Network conditions vary, but typical rates:
+- Light network (100 tx/block): 5,000 blocks/hour
+- Medium network (500 tx/block): 2,000 blocks/hour
+- Heavy network (2,000 tx/block): 500 blocks/hour
+
+Example re-indexing times:
+- 100,000 blocks (light): 20 hours
+- 1,000,000 blocks (light): 200 hours (8 days)
+- Recent 10,000 blocks (any): 2-3 hours
+
+**Optimization for Faster Re-indexing:**
+```bash
+# Increase indexer concurrency
+fly secrets set YACI_CONCURRENCY=10 -a republic-yaci-indexer
+
+# Reduce block time for faster polling
+fly secrets set YACI_BLOCK_TIME=1s -a republic-yaci-indexer
+
+# Temporarily disable triggers during bulk re-index
+fly postgres connect -a republic-yaci-pg -c "
+ALTER TABLE api.transactions_raw DISABLE TRIGGER ALL;
+ALTER TABLE api.blocks_raw DISABLE TRIGGER ALL;
+"
+
+# After re-indexing completes, re-enable and backfill
+fly postgres connect -a republic-yaci-pg -c "
+ALTER TABLE api.transactions_raw ENABLE TRIGGER ALL;
+ALTER TABLE api.blocks_raw ENABLE TRIGGER ALL;
+"
+
+# Run backfill script
+cd ~/repos/yaci-explorer-apis
+fly proxy 15433:5432 -a republic-yaci-pg &
+export DATABASE_URL="postgres://postgres:PASSWORD@localhost:15433/postgres"
+npx tsx scripts/backfill-triggers.ts
+```
+
+**Hybrid Approach:**
+For best of both worlds, restore recent backup then re-index from that point forward:
+```bash
+# Restore backup from 7 days ago (instant)
+fly postgres backup restore <backup-id> -a republic-yaci-pg
+
+# Check latest block in backup
+fly postgres connect -a republic-yaci-pg -c "SELECT MAX(id) FROM api.blocks_raw;"
+# Result: 1,500,000
+
+# Start indexer (automatically resumes from 1,500,000)
+fly machine start <indexer-id> -a republic-yaci-indexer
+
+# Only needs to index 7 days of blocks instead of full history
 ```
 
 ### Handling Genesis Resets (Devnet)
