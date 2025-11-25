@@ -230,8 +230,10 @@ class GovernancePoller {
   }
 }
 
-// Start worker if run directly
-if (require.main === module) {
+// ESM entry point check
+const isMainModule = import.meta.url === `file://${process.argv[1]}`
+
+if (isMainModule) {
   const poller = new GovernancePoller()
 
   process.on('SIGINT', async () => {

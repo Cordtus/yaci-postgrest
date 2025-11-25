@@ -237,7 +237,10 @@ const server = createServer(async (req, res) => {
   }
 })
 
-if (require.main === module) {
+// ESM entry point check
+const isMainModule = import.meta.url === `file://${process.argv[1]}`
+
+if (isMainModule) {
   if (!DATABASE_URL) {
     console.error('DATABASE_URL environment variable is required')
     process.exit(1)
