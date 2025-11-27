@@ -11,7 +11,7 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import pg from 'pg'
 import protobuf from 'protobufjs'
-import { Transaction, keccak256, hexlify, getAddress } from 'ethers'
+import { Transaction, keccak256, hexlify, getAddress, getCreateAddress, Interface, AbiCoder } from 'ethers'
 
 const { Pool } = pg
 
@@ -40,6 +40,8 @@ interface DecodedTx {
 	status: number
 	function_name: string | null
 	function_signature: string | null
+	decoded_args: Record<string, string> | null
+	contract_address: string | null
 }
 
 interface DecodedLog {
@@ -51,6 +53,71 @@ interface DecodedLog {
 }
 
 let sigCache: Map<string, string> = new Map()
+
+// Well-known event signatures
+const EVENT_SIGNATURES = {
+	// ERC-20
+	TRANSFER: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+	APPROVAL: '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925',
+	// ERC-721
+	TRANSFER_721: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', // Same as ERC-20 but with indexed tokenId
+	APPROVAL_721: '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925',
+	APPROVAL_FOR_ALL: '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31',
+	// ERC-1155
+	TRANSFER_SINGLE: '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62',
+	TRANSFER_BATCH: '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb',
+}
+
+// Standard ERC interface IDs for ERC-165 detection
+const INTERFACE_IDS = {
+	ERC721: '0x80ac58cd',
+	ERC1155: '0xd9b67a26',
+	ERC20: null, // ERC-20 doesn't support ERC-165
+}
+
+/**
+ * Decode function call data using ethers.js when signature is known
+ */
+function decodeFunctionCall(data: string, signature: string): Record<string, string> | null {
+	try {
+		const iface = new Interface([`function ${signature}`])
+		const decoded = iface.parseTransaction({ data })
+		if (!decoded) return null
+
+		const result: Record<string, string> = {}
+		decoded.fragment.inputs.forEach((input, i) => {
+			const value = decoded.args[i]
+			result[input.name || `arg${i}`] = value?.toString() || ''
+		})
+		return result
+	} catch {
+		return null
+	}
+}
+
+/**
+ * Determine token type from event log patterns
+ * ERC-721 Transfer has 4 topics (topic0 + 3 indexed: from, to, tokenId)
+ * ERC-20 Transfer has 3 topics (topic0 + 2 indexed: from, to) + value in data
+ */
+function detectTokenType(log: DecodedLog): 'ERC20' | 'ERC721' | 'ERC1155' | null {
+	const topic0 = log.topics[0]
+
+	if (topic0 === EVENT_SIGNATURES.TRANSFER_SINGLE || topic0 === EVENT_SIGNATURES.TRANSFER_BATCH) {
+		return 'ERC1155'
+	}
+
+	if (topic0 === EVENT_SIGNATURES.TRANSFER) {
+		// ERC-721: from, to, tokenId are all indexed (4 topics total)
+		// ERC-20: from, to indexed, value in data (3 topics total)
+		if (log.topics.length === 4) {
+			return 'ERC721'
+		}
+		return 'ERC20'
+	}
+
+	return null
+}
 
 async function fetch4ByteSignature(selector: string): Promise<string | null> {
 	if (sigCache.has(selector)) {
@@ -99,6 +166,8 @@ function decodeTransaction(rawBase64: string, txId: string, gasUsed: number | nu
 			status: 1,
 			function_name: null,
 			function_signature: null,
+			decoded_args: null,
+			contract_address: null,
 		}
 	} catch (err) {
 		console.error(`Failed to decode transaction ${txId}:`, err)
@@ -198,8 +267,11 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 							[log.tx_id, log.log_index, log.address, log.topics, log.data]
 						)
 
-						const TRANSFER_SIG = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-						if (log.topics[0] === TRANSFER_SIG && log.topics.length >= 3) {
+						// Detect token type and process transfers
+						const tokenType = detectTokenType(log)
+
+						if (tokenType === 'ERC20' && log.topics.length >= 3) {
+							// ERC-20 Transfer: from, to indexed; value in data
 							const fromAddr = '0x' + log.topics[1].slice(26)
 							const toAddr = '0x' + log.topics[2].slice(26)
 							const value = log.data || '0x0'
@@ -217,9 +289,98 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 								 ON CONFLICT (address) DO NOTHING`,
 								[log.address]
 							)
+						} else if (tokenType === 'ERC721' && log.topics.length >= 4) {
+							// ERC-721 Transfer: from, to, tokenId all indexed
+							const fromAddr = '0x' + log.topics[1].slice(26)
+							const toAddr = '0x' + log.topics[2].slice(26)
+							const tokenId = log.topics[3] // tokenId is the 4th topic
+
+							await client.query(
+								`INSERT INTO api.evm_token_transfers (tx_id, log_index, token_address, from_address, to_address, value)
+								 VALUES ($1, $2, $3, $4, $5, $6)
+								 ON CONFLICT (tx_id, log_index) DO NOTHING`,
+								[tx_id, log.log_index, log.address, fromAddr, toAddr, tokenId]
+							)
+
+							await client.query(
+								`INSERT INTO api.evm_tokens (address, type, is_verified)
+								 VALUES ($1, 'ERC721', false)
+								 ON CONFLICT (address) DO UPDATE SET type = 'ERC721' WHERE api.evm_tokens.type = 'ERC20'`,
+								[log.address]
+							)
+						} else if (tokenType === 'ERC1155') {
+							// ERC-1155 TransferSingle: operator, from, to indexed; id, value in data
+							if (log.topics[0] === EVENT_SIGNATURES.TRANSFER_SINGLE && log.topics.length >= 4) {
+								const fromAddr = '0x' + log.topics[2].slice(26)
+								const toAddr = '0x' + log.topics[3].slice(26)
+								// Decode id and value from data
+								try {
+									const abiCoder = AbiCoder.defaultAbiCoder()
+									const [id, value] = abiCoder.decode(['uint256', 'uint256'], log.data)
+									await client.query(
+										`INSERT INTO api.evm_token_transfers (tx_id, log_index, token_address, from_address, to_address, value)
+										 VALUES ($1, $2, $3, $4, $5, $6)
+										 ON CONFLICT (tx_id, log_index) DO NOTHING`,
+										[tx_id, log.log_index, log.address, fromAddr, toAddr, `${id.toString()}:${value.toString()}`]
+									)
+								} catch {}
+
+								await client.query(
+									`INSERT INTO api.evm_tokens (address, type, is_verified)
+									 VALUES ($1, 'ERC1155', false)
+									 ON CONFLICT (address) DO UPDATE SET type = 'ERC1155'`,
+									[log.address]
+								)
+							}
+						}
+
+						// Also track Approval events for ERC-20
+						if (log.topics[0] === EVENT_SIGNATURES.APPROVAL && log.topics.length >= 3) {
+							// Could store approvals in a separate table if needed
+							// For now, just ensure the token is registered
+							await client.query(
+								`INSERT INTO api.evm_tokens (address, type, is_verified)
+								 VALUES ($1, 'ERC20', false)
+								 ON CONFLICT (address) DO NOTHING`,
+								[log.address]
+							)
 						}
 					}
 				}
+			}
+
+			// Handle contract deployments (to === null)
+			if (decoded.to === null && decoded.from && decoded.status === 1) {
+				const contractAddress = getCreateAddress({
+					from: decoded.from,
+					nonce: decoded.nonce
+				})
+
+				// Store contract address on the transaction record
+				decoded.contract_address = contractAddress.toLowerCase()
+
+				// Compute bytecode hash from init code
+				const bytecodeHash = decoded.data ? keccak256(decoded.data) : null
+
+				// Get the block height for this transaction
+				const heightQuery = await client.query(
+					'SELECT height FROM api.transactions_main WHERE id = $1',
+					[tx_id]
+				)
+				const height = heightQuery.rows[0]?.height || null
+
+				await client.query(
+					`INSERT INTO api.evm_contracts (address, creator, creation_tx, creation_height, bytecode_hash)
+					 VALUES ($1, $2, $3, $4, $5)
+					 ON CONFLICT (address) DO UPDATE SET
+					   creator = EXCLUDED.creator,
+					   creation_tx = EXCLUDED.creation_tx,
+					   creation_height = EXCLUDED.creation_height,
+					   bytecode_hash = EXCLUDED.bytecode_hash`,
+					[contractAddress.toLowerCase(), decoded.from.toLowerCase(), tx_id, height, bytecodeHash]
+				)
+
+				console.log(`  Contract deployed: ${contractAddress} by ${decoded.from}`)
 			}
 
 			// Lookup function signature if we have call data (skip for contract deployments)
@@ -229,6 +390,12 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 				if (signature) {
 					decoded.function_signature = signature
 					decoded.function_name = signature.split('(')[0]
+
+					// Try to decode function arguments
+					const decodedArgs = decodeFunctionCall(decoded.data, signature)
+					if (decodedArgs) {
+						decoded.decoded_args = decodedArgs
+					}
 				}
 			}
 
@@ -237,8 +404,9 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 				`INSERT INTO api.evm_transactions (
 					tx_id, hash, "from", "to", nonce, gas_limit, gas_price,
 					max_fee_per_gas, max_priority_fee_per_gas, value, data, type,
-					chain_id, gas_used, status, function_name, function_signature
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+					chain_id, gas_used, status, function_name, function_signature,
+					decoded_args, contract_address
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 				ON CONFLICT (tx_id) DO NOTHING`,
 				[
 					decoded.tx_id,
@@ -258,6 +426,8 @@ async function processBatch(pool: pg.Pool, root: protobuf.Root): Promise<number>
 					decoded.status,
 					decoded.function_name,
 					decoded.function_signature,
+					decoded.decoded_args ? JSON.stringify(decoded.decoded_args) : null,
+					decoded.contract_address,
 				]
 			)
 		}
