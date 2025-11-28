@@ -2,13 +2,15 @@
 
 This document provides comprehensive coverage of the YACI Explorer three-component blockchain indexing and exploration system.
 
+**Note:** Throughout this document, `yaci-pg` refers to your Fly.io PostgreSQL app, `yaci-indexer` to the indexer app, and `yaci-explorer-apis` to the middleware app. Replace these with your actual Fly.io app names.
+
 ## System Architecture Overview
 
 ### Component Purpose and Interaction
 
 The YACI Explorer stack consists of three specialized components working in concert to provide blockchain data indexing, processing, and visualization:
 
-**1. Yaci Indexer** (github.com/dyphira-git/yaci)
+**1. Yaci Indexer** (github.com/Cordtus/yaci)
 - Go-based blockchain data extraction engine
 - Connects directly to Cosmos SDK chain gRPC endpoints
 - Continuously polls for new blocks and transactions
@@ -17,7 +19,7 @@ The YACI Explorer stack consists of three specialized components working in conc
 - Configurable concurrency and retry mechanisms
 - DO NOT MODIFY - external dependency maintained separately
 
-**2. Middleware Layer** (github.com/dyphira-git/yaci-explorer-apis)
+**2. Middleware Layer** (github.com/Cordtus/yaci-explorer-apis)
 - Three-process architecture on Fly.io:
   - `app`: PostgREST API server (port 3000)
   - `worker`: EVM decode daemon (batch processing)
@@ -31,7 +33,7 @@ The YACI Explorer stack consists of three specialized components working in conc
 - TypeScript client package for type-safe API consumption
 - All business logic lives here - never in frontend or indexer
 
-**3. Frontend Application** (github.com/dyphira-git/yaci-explorer)
+**3. Frontend Application** (github.com/Cordtus/yaci-explorer)
 - React Router 7 client-only application (SSR disabled)
 - TanStack Query manages server state with intelligent caching
 - Radix UI components with Tailwind CSS styling
@@ -170,7 +172,7 @@ Consider adding PgBouncer when:
 Basic PgBouncer configuration:
 ```ini
 [databases]
-postgres = host=republic-yaci-pg.flycast port=5432 dbname=postgres
+postgres = host=yaci-pg.flycast port=5432 dbname=postgres
 
 [pgbouncer]
 pool_mode = transaction
@@ -260,8 +262,10 @@ WHERE state = 'idle'
 **Raw Storage Tables (written by Yaci):**
 - `api.blocks_raw`: Block data with full header, transactions, last_commit
 - `api.transactions_raw`: Transaction data with tx body, auth info, response
-- `api.messages_raw`: Flattened messages (populated by trigger)
-- `api.events_raw`: Flattened events (populated by trigger)
+
+**Intermediate Tables (populated by triggers):**
+- `api.messages_raw`: Flattened messages with raw data
+- `api.events_raw`: Flattened events with raw data
 
 **Parsed Tables (populated by triggers):**
 - `api.transactions_main`: Height, timestamp, fee, memo, error, proposal_ids
@@ -269,24 +273,38 @@ WHERE state = 'idle'
 - `api.events_main`: Normalized key-value event attributes
 
 **EVM Tables (populated by worker):**
-- `api.evm_transactions`: Decoded EVM tx fields (from, to, value, data, gas)
+- `api.evm_transactions`: Decoded EVM tx fields (from, to, value, data, gas, function_name, function_signature)
 - `api.evm_logs`: Event logs with topics and data
-- `api.evm_token_transfers`: Parsed ERC-20/721 transfers
-- `api.evm_tokens`: Token metadata cache
+- `api.evm_token_transfers`: Parsed ERC-20 transfers
+- `api.evm_tokens`: Token metadata cache (address, name, symbol, decimals, type)
 - `api.evm_contracts`: Contract metadata, ABI, and source code storage
 
-**Analytics Views and Materialized Views:**
-- `api.mv_daily_tx_stats`: Daily transaction counts, success/fail, unique senders (materialized)
-- `api.mv_hourly_tx_stats`: Hourly transaction counts for last 7 days (materialized)
-- `api.mv_message_type_stats`: Message type distribution with percentages (materialized)
-- `api.tx_volume_daily/hourly`: Transaction counts aggregated by time
-- `api.message_type_stats`: Message type distribution
-- `api.evm_pending_decode`: View of EVM transactions awaiting decode
-- `api.query_stats`: pg_stat_statements wrapper for performance monitoring
+**Cosmos Domain Tables:**
+- `api.validators`: Validator metadata and status
+- `api.proposals`: Governance proposals (from 001_complete_schema)
+- `api.proposal_votes`: Individual vote records
+- `api.ibc_channels`: IBC channel metadata
+- `api.denom_metadata`: Token denomination metadata
 
-**Governance Tables:**
+**Analytics Views:**
+- `api.chain_stats`: latest_block, total_transactions, unique_addresses, evm_transactions, active_validators
+- `api.tx_volume_daily`: Transaction counts by date
+- `api.tx_volume_hourly`: Transaction counts by hour
+- `api.message_type_stats`: Message type distribution
+- `api.tx_success_rate`: Success/failure statistics
+- `api.fee_revenue`: Fee totals by denomination
+- `api.evm_tx_map`: EVM transaction hash mapping
+- `api.evm_pending_decode`: View of EVM transactions awaiting decode
+
+**Materialized Views (require periodic refresh):**
+- `api.mv_daily_tx_stats`: Daily transaction counts, success/fail, unique senders
+- `api.mv_hourly_tx_stats`: Hourly transaction counts for last 7 days
+- `api.mv_message_type_stats`: Message type distribution with percentages
+
+**Governance Tables (trigger-populated):**
 - `api.governance_proposals`: Proposals detected from indexed MsgSubmitProposal
 - `api.governance_snapshots`: Historical proposal state snapshots
+- `api.governance_active_proposals`: View of proposals in deposit/voting period
 
 **Refresh Materialized Views:**
 ```sql
@@ -323,7 +341,7 @@ SELECT api.refresh_analytics_views();
 GRANT SELECT ON api.transactions_main TO web_anon;
 GRANT SELECT ON api.messages_main TO web_anon;
 GRANT SELECT ON api.events_main TO web_anon;
-GRANT EXECUTE ON FUNCTION api.get_messages_for_address(TEXT) TO web_anon;
+GRANT EXECUTE ON FUNCTION api.get_transactions_by_address(TEXT, INT, INT) TO web_anon;
 ```
 
 ## Deployment Procedures
@@ -339,16 +357,16 @@ GRANT EXECUTE ON FUNCTION api.get_messages_for_address(TEXT) TO web_anon;
 
 ```bash
 # Create managed PostgreSQL instance
-fly postgres create republic-yaci-pg \
+fly postgres create yaci-pg \
   --region sjc \
   --vm-size shared-cpu-1x \
   --volume-size 10
 
 # Save connection string output
-# postgres://postgres:PASSWORD@republic-yaci-pg.flycast:5432
+# postgres://postgres:PASSWORD@yaci-pg.flycast:5432
 
 # Verify connectivity
-fly postgres connect -a republic-yaci-pg
+fly postgres connect -a yaci-pg
 ```
 
 **Step 2: Apply Database Migrations**
@@ -357,13 +375,13 @@ fly postgres connect -a republic-yaci-pg
 cd ~/repos/yaci-explorer-apis
 
 # Apply all migrations in order
-cat migrations/001_complete_schema.sql | fly postgres connect -a republic-yaci-pg
-cat migrations/002_add_yaci_triggers.sql | fly postgres connect -a republic-yaci-pg
-cat migrations/003_fix_proposal_ids_type.sql | fly postgres connect -a republic-yaci-pg
+cat migrations/001_complete_schema.sql | fly postgres connect -a yaci-pg
+cat migrations/002_add_yaci_triggers.sql | fly postgres connect -a yaci-pg
+cat migrations/003_fix_proposal_ids_type.sql | fly postgres connect -a yaci-pg
 
 # Verify schema
-fly postgres connect -a republic-yaci-pg -c "\dt api.*"
-fly postgres connect -a republic-yaci-pg -c "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = 'api.transactions_raw'::regclass;"
+fly postgres connect -a yaci-pg -c "\dt api.*"
+fly postgres connect -a yaci-pg -c "SELECT COUNT(*) FROM pg_trigger WHERE tgrelid = 'api.transactions_raw'::regclass;"
 ```
 
 **Step 3: Deploy Middleware**
@@ -376,11 +394,11 @@ fly apps create yaci-explorer-apis --org personal
 
 # Set secrets
 fly secrets set \
-  DATABASE_URL="postgres://postgres:PASSWORD@republic-yaci-pg.flycast:5432/postgres?sslmode=disable" \
+  DATABASE_URL="postgres://postgres:PASSWORD@yaci-pg.flycast:5432/postgres?sslmode=disable" \
   -a yaci-explorer-apis
 
 fly secrets set \
-  PGRST_DB_URI="postgres://authenticator:PASSWORD@republic-yaci-pg.flycast:5432/postgres" \
+  PGRST_DB_URI="postgres://authenticator:PASSWORD@yaci-pg.flycast:5432/postgres" \
   -a yaci-explorer-apis
 
 # Deploy with fly.toml configuration
@@ -400,19 +418,19 @@ curl https://yaci-explorer-apis.fly.dev/
 cd ~/repos/yaci
 
 # Create app (if not exists)
-fly apps create republic-yaci-indexer --org personal
+fly apps create yaci-indexer --org personal
 
 # Set secrets
 fly secrets set \
-  YACI_POSTGRES_DSN="postgres://yaci_writer:PASSWORD@republic-yaci-pg.flycast:5432/postgres" \
+  YACI_POSTGRES_DSN="postgres://yaci_writer:PASSWORD@yaci-pg.flycast:5432/postgres" \
   YACI_GRPC_ENDPOINT="rpc.example.com:9090" \
-  -a republic-yaci-indexer
+  -a yaci-indexer
 
 # Deploy
-fly deploy -a republic-yaci-indexer
+fly deploy -a yaci-indexer
 
 # Monitor logs for progress
-fly logs -a republic-yaci-indexer
+fly logs -a yaci-indexer
 ```
 
 **Step 5: Deploy Frontend**
@@ -452,14 +470,14 @@ fly deploy -a yaci-explorer
 **Database Migrations:**
 ```bash
 # Always test in development first
-cat migrations/004_new_migration.sql | fly postgres connect -a republic-yaci-pg
+cat migrations/004_new_migration.sql | fly postgres connect -a yaci-pg
 ```
 
 **Indexer Updates (use with caution):**
 ```bash
 cd ~/repos/yaci
 git pull origin main
-fly deploy -a republic-yaci-indexer
+fly deploy -a yaci-indexer
 ```
 
 ### Rollback Procedures
@@ -476,10 +494,10 @@ fly releases rollback <version> -a yaci-explorer-apis
 **Database Rollback:**
 ```bash
 # Restore from backup
-fly postgres connect -a republic-yaci-pg < backup.sql
+fly postgres connect -a yaci-pg < backup.sql
 
 # Or use Fly backup restore
-fly postgres backup restore <backup-id> -a republic-yaci-pg
+fly postgres backup restore <backup-id> -a yaci-pg
 ```
 
 ## Operations Manual
@@ -488,7 +506,7 @@ fly postgres backup restore <backup-id> -a republic-yaci-pg
 
 **Check Current Status:**
 ```bash
-fly status -a republic-yaci-indexer
+fly status -a yaci-indexer
 fly status -a yaci-explorer-apis
 fly status -a yaci-explorer
 ```
@@ -496,15 +514,15 @@ fly status -a yaci-explorer
 **Stop Indexer (for maintenance):**
 ```bash
 # List machines
-fly machines list -a republic-yaci-indexer
+fly machines list -a yaci-indexer
 
 # Stop specific machine
-fly machine stop <machine-id> -a republic-yaci-indexer
+fly machine stop <machine-id> -a yaci-indexer
 ```
 
 **Start Indexer:**
 ```bash
-fly machine start <machine-id> -a republic-yaci-indexer
+fly machine start <machine-id> -a yaci-indexer
 ```
 
 **Restart Middleware:**
@@ -554,7 +572,7 @@ fly scale count 2 --process-group=worker -a yaci-explorer-apis
 
 ```bash
 # Check indexer progress
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   MAX(id) as latest_block,
   COUNT(*) as total_blocks,
@@ -563,7 +581,7 @@ FROM api.blocks_raw;
 "
 
 # Check parsed data status
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   (SELECT COUNT(*) FROM api.transactions_raw) as raw_txs,
   (SELECT COUNT(*) FROM api.transactions_main) as parsed_txs,
@@ -572,14 +590,14 @@ SELECT
 "
 
 # Check EVM decode status
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   (SELECT COUNT(*) FROM api.evm_pending_decode) as pending,
   (SELECT COUNT(*) FROM api.evm_transactions) as decoded;
 "
 
 # Check governance proposals
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT proposal_id, title, status, last_updated
 FROM api.governance_proposals
 ORDER BY proposal_id DESC
@@ -596,7 +614,7 @@ curl -i https://yaci-explorer-apis.fly.dev/
 fly logs -a yaci-explorer-apis --instance=<app-id>
 
 # Check database connections
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   datname,
   usename,
@@ -629,10 +647,10 @@ fly dashboard -a yaci-explorer-apis
 **Weekly:**
 ```bash
 # Vacuum and analyze database
-fly postgres connect -a republic-yaci-pg -c "VACUUM ANALYZE;"
+fly postgres connect -a yaci-pg -c "VACUUM ANALYZE;"
 
 # Check table sizes
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   schemaname,
   tablename,
@@ -645,7 +663,7 @@ ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
 "
 
 # Check slow queries
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   query,
   calls,
@@ -660,13 +678,13 @@ LIMIT 10;
 **Monthly:**
 ```bash
 # Backup database
-fly postgres backup create -a republic-yaci-pg
+fly postgres backup create -a yaci-pg
 
 # Review backup retention
-fly postgres backup list -a republic-yaci-pg
+fly postgres backup list -a yaci-pg
 
 # Check index health
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   schemaname,
   tablename,
@@ -692,7 +710,7 @@ Fly.io automatically creates daily snapshots of your PostgreSQL database. These 
 **List Available Backups:**
 ```bash
 # View all backups with timestamps and sizes
-fly postgres backup list -a republic-yaci-pg
+fly postgres backup list -a yaci-pg
 
 # Output shows:
 # ID    CREATED AT           SIZE
@@ -703,7 +721,7 @@ fly postgres backup list -a republic-yaci-pg
 **Restore from Backup:**
 ```bash
 # Restore specific backup to existing database
-fly postgres backup restore 12345 -a republic-yaci-pg
+fly postgres backup restore 12345 -a yaci-pg
 
 # WARNING: This will stop the database and restore the backup
 # All connected applications will be disconnected temporarily
@@ -727,7 +745,7 @@ Manual backups provide additional control and allow local storage for compliance
 **Create Manual Snapshot:**
 ```bash
 # Trigger on-demand backup
-fly postgres backup create -a republic-yaci-pg
+fly postgres backup create -a yaci-pg
 
 # Use for:
 # - Before major migrations
@@ -739,7 +757,7 @@ fly postgres backup create -a republic-yaci-pg
 **Export to Local File:**
 ```bash
 # Step 1: Create proxy tunnel to database
-fly proxy 15433:5432 -a republic-yaci-pg &
+fly proxy 15433:5432 -a yaci-pg &
 PROXY_PID=$!
 
 # Step 2: Export using pg_dump
@@ -808,8 +826,8 @@ PITR allows recovery to any specific timestamp by replaying Write-Ahead Log (WAL
 ```bash
 # Note: Fly.io managed Postgres may have limited PITR support
 # Check current WAL settings
-fly postgres connect -a republic-yaci-pg -c "SHOW wal_level;"
-fly postgres connect -a republic-yaci-pg -c "SHOW archive_mode;"
+fly postgres connect -a yaci-pg -c "SHOW wal_level;"
+fly postgres connect -a yaci-pg -c "SHOW archive_mode;"
 
 # For self-managed instances, enable archiving:
 # Edit postgresql.conf:
@@ -829,27 +847,27 @@ fly postgres connect -a republic-yaci-pg -c "SHOW archive_mode;"
 *Recovery Steps:*
 ```bash
 # Step 1: Stop all connected services
-fly machine stop <indexer-id> -a republic-yaci-indexer
+fly machine stop <indexer-id> -a yaci-indexer
 fly machine stop <middleware-id> -a yaci-explorer-apis
 
 # Step 2: Identify last good backup
-fly postgres backup list -a republic-yaci-pg
+fly postgres backup list -a yaci-pg
 
 # Step 3: Restore from backup
-fly postgres backup restore <backup-id> -a republic-yaci-pg
+fly postgres backup restore <backup-id> -a yaci-pg
 
 # Step 4: Verify database integrity
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT COUNT(*) FROM api.blocks_raw;
 SELECT MAX(id) as latest_block FROM api.blocks_raw;
 "
 
 # Step 5: Restart services
-fly machine start <indexer-id> -a republic-yaci-indexer
+fly machine start <indexer-id> -a yaci-indexer
 fly machine start <middleware-id> -a yaci-explorer-apis
 
 # Step 6: Monitor indexer catching up
-fly logs -a republic-yaci-indexer
+fly logs -a yaci-indexer
 ```
 
 *Expected Downtime:* 15-30 minutes depending on backup size
@@ -861,7 +879,7 @@ fly logs -a republic-yaci-indexer
 *Recovery Steps:*
 ```bash
 # Option 1: Restore specific table from backup
-fly proxy 15433:5432 -a republic-yaci-pg &
+fly proxy 15433:5432 -a yaci-pg &
 
 # Restore only affected table
 pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
@@ -888,33 +906,33 @@ psql -c "INSERT INTO api.transactions_main
 *Recovery Steps:*
 ```bash
 # Step 1: Create new PostgreSQL instance in different region
-fly postgres create republic-yaci-pg-recovery \
+fly postgres create yaci-pg-recovery \
   --region ord \
   --vm-size shared-cpu-1x \
   --volume-size 10
 
 # Step 2: Restore from local backup if available
-fly proxy 15433:5432 -a republic-yaci-pg-recovery &
+fly proxy 15433:5432 -a yaci-pg-recovery &
 pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
   --jobs=4 \
   backup.dump
 
 # Step 3: Apply any migrations since backup
-cat migrations/*.sql | fly postgres connect -a republic-yaci-pg-recovery
+cat migrations/*.sql | fly postgres connect -a yaci-pg-recovery
 
 # Step 4: Update middleware secrets
 fly secrets set \
-  DATABASE_URL="postgres://postgres:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
-  PGRST_DB_URI="postgres://authenticator:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
+  DATABASE_URL="postgres://postgres:NEWPASS@yaci-pg-recovery.flycast:5432/postgres" \
+  PGRST_DB_URI="postgres://authenticator:NEWPASS@yaci-pg-recovery.flycast:5432/postgres" \
   -a yaci-explorer-apis
 
 # Step 5: Update indexer secret
 fly secrets set \
-  YACI_POSTGRES_DSN="postgres://yaci_writer:NEWPASS@republic-yaci-pg-recovery.flycast:5432/postgres" \
-  -a republic-yaci-indexer
+  YACI_POSTGRES_DSN="postgres://yaci_writer:NEWPASS@yaci-pg-recovery.flycast:5432/postgres" \
+  -a yaci-indexer
 
 # Step 6: Restart all services
-fly machine restart <indexer-id> -a republic-yaci-indexer
+fly machine restart <indexer-id> -a yaci-indexer
 fly machine restart <middleware-id> -a yaci-explorer-apis
 
 # Step 7: If no backup available, proceed to re-indexing (see below)
@@ -929,21 +947,21 @@ Regular recovery testing validates backup integrity and documents procedures.
 **Monthly Recovery Test:**
 ```bash
 # Step 1: Create test database
-fly postgres create republic-yaci-pg-test \
+fly postgres create yaci-pg-test \
   --region sjc \
   --vm-size shared-cpu-1x \
   --volume-size 5
 
 # Step 2: Restore latest backup to test instance
-fly postgres backup list -a republic-yaci-pg
-fly proxy 15433:5432 -a republic-yaci-pg-test &
+fly postgres backup list -a yaci-pg
+fly proxy 15433:5432 -a yaci-pg-test &
 
 pg_restore --dbname="postgres://postgres:PASSWORD@localhost:15433/postgres" \
   --jobs=4 \
   production_backup.dump
 
 # Step 3: Run validation queries
-fly postgres connect -a republic-yaci-pg-test -c "
+fly postgres connect -a yaci-pg-test -c "
 SELECT
   (SELECT COUNT(*) FROM api.blocks_raw) as blocks,
   (SELECT COUNT(*) FROM api.transactions_main) as transactions,
@@ -951,7 +969,7 @@ SELECT
 "
 
 # Step 4: Test API connectivity
-export PGRST_DB_URI="postgres://authenticator:PASSWORD@republic-yaci-pg-test.flycast:5432/postgres"
+export PGRST_DB_URI="postgres://authenticator:PASSWORD@yaci-pg-test.flycast:5432/postgres"
 postgrest &
 curl http://localhost:3000/transactions_main?limit=10
 
@@ -959,7 +977,7 @@ curl http://localhost:3000/transactions_main?limit=10
 echo "Recovery Test $(date): SUCCESS - Restored ${BLOCK_COUNT} blocks in ${DURATION}s" >> recovery_tests.log
 
 # Step 6: Clean up test resources
-fly postgres destroy republic-yaci-pg-test
+fly postgres destroy yaci-pg-test
 ```
 
 **Test Frequency Recommendations:**
@@ -990,10 +1008,10 @@ For blockchain data, re-indexing from the chain source is always possible and of
 
 ```bash
 # Step 1: Stop indexer
-fly machine stop <indexer-id> -a republic-yaci-indexer
+fly machine stop <indexer-id> -a yaci-indexer
 
 # Step 2: Truncate all data tables
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 BEGIN;
 
 -- Raw data tables
@@ -1024,7 +1042,7 @@ COMMIT;
 "
 
 # Step 3: Verify clean state
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   (SELECT COUNT(*) FROM api.blocks_raw) as blocks,
   (SELECT COUNT(*) FROM api.transactions_raw) as txs,
@@ -1035,16 +1053,16 @@ SELECT
 # Step 4: Optionally override start height
 # Default: Indexer resumes from MAX(id), which will be 0
 # Override to start from specific block:
-fly secrets set YACI_START=1000000 -a republic-yaci-indexer
+fly secrets set YACI_START=1000000 -a yaci-indexer
 
 # Step 5: Start indexer
-fly machine start <indexer-id> -a republic-yaci-indexer
+fly machine start <indexer-id> -a yaci-indexer
 
 # Step 6: Monitor progress
-fly logs -a republic-yaci-indexer -f
+fly logs -a yaci-indexer -f
 
 # Step 7: Check progress periodically
-watch -n 30 'fly postgres connect -a republic-yaci-pg -c "
+watch -n 30 'fly postgres connect -a yaci-pg -c "
 SELECT
   MAX(id) as current_block,
   COUNT(*) as total_blocks,
@@ -1068,26 +1086,26 @@ Example re-indexing times:
 **Optimization for Faster Re-indexing:**
 ```bash
 # Increase indexer concurrency
-fly secrets set YACI_MAX_CONCURRENCY=10 -a republic-yaci-indexer
+fly secrets set YACI_MAX_CONCURRENCY=10 -a yaci-indexer
 
 # Reduce block time for faster polling
-fly secrets set YACI_BLOCK_TIME=1 -a republic-yaci-indexer
+fly secrets set YACI_BLOCK_TIME=1 -a yaci-indexer
 
 # Temporarily disable triggers during bulk re-index
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 ALTER TABLE api.transactions_raw DISABLE TRIGGER ALL;
 ALTER TABLE api.blocks_raw DISABLE TRIGGER ALL;
 "
 
 # After re-indexing completes, re-enable and backfill
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 ALTER TABLE api.transactions_raw ENABLE TRIGGER ALL;
 ALTER TABLE api.blocks_raw ENABLE TRIGGER ALL;
 "
 
 # Run backfill script
 cd ~/repos/yaci-explorer-apis
-fly proxy 15433:5432 -a republic-yaci-pg &
+fly proxy 15433:5432 -a yaci-pg &
 export DATABASE_URL="postgres://postgres:PASSWORD@localhost:15433/postgres"
 npx tsx scripts/backfill-triggers.ts
 ```
@@ -1096,14 +1114,14 @@ npx tsx scripts/backfill-triggers.ts
 For best of both worlds, restore recent backup then re-index from that point forward:
 ```bash
 # Restore backup from 7 days ago (instant)
-fly postgres backup restore <backup-id> -a republic-yaci-pg
+fly postgres backup restore <backup-id> -a yaci-pg
 
 # Check latest block in backup
-fly postgres connect -a republic-yaci-pg -c "SELECT MAX(id) FROM api.blocks_raw;"
+fly postgres connect -a yaci-pg -c "SELECT MAX(id) FROM api.blocks_raw;"
 # Result: 1,500,000
 
 # Start indexer (automatically resumes from 1,500,000)
-fly machine start <indexer-id> -a republic-yaci-indexer
+fly machine start <indexer-id> -a yaci-indexer
 
 # Only needs to index 7 days of blocks instead of full history
 ```
@@ -1114,10 +1132,10 @@ When a development network resets from block 1:
 
 ```bash
 # Step 1: Stop indexer immediately
-fly machine stop <indexer-id> -a republic-yaci-indexer
+fly machine stop <indexer-id> -a yaci-indexer
 
 # Step 2: Truncate all data tables
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 BEGIN;
 TRUNCATE api.blocks_raw CASCADE;
 TRUNCATE api.transactions_raw CASCADE;
@@ -1129,17 +1147,17 @@ COMMIT;
 "
 
 # Step 3: Verify clean state
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   (SELECT COUNT(*) FROM api.blocks_raw) as blocks,
   (SELECT COUNT(*) FROM api.transactions_raw) as txs;
 "
 
 # Step 4: Start indexer (will automatically resume from block 1)
-fly machine start <indexer-id> -a republic-yaci-indexer
+fly machine start <indexer-id> -a yaci-indexer
 
 # Step 5: Monitor restart
-fly logs -a republic-yaci-indexer
+fly logs -a yaci-indexer
 ```
 
 ### Trigger Backfill Process
@@ -1150,7 +1168,7 @@ If database triggers are added after data already exists:
 cd ~/repos/yaci-explorer-apis
 
 # Start proxy to database
-fly proxy 15433:5432 -a republic-yaci-pg &
+fly proxy 15433:5432 -a yaci-pg &
 
 # Run backfill script
 export DATABASE_URL="postgres://postgres:PASSWORD@localhost:15433/postgres?sslmode=disable"
@@ -1175,13 +1193,13 @@ npx tsx scripts/backfill-triggers.ts
 **Diagnosis:**
 ```bash
 # Check if indexer is writing data
-fly postgres connect -a republic-yaci-pg -c "SELECT COUNT(*) FROM api.transactions_raw;"
+fly postgres connect -a yaci-pg -c "SELECT COUNT(*) FROM api.transactions_raw;"
 
 # Check if triggers are parsing data
-fly postgres connect -a republic-yaci-pg -c "SELECT COUNT(*) FROM api.transactions_main;"
+fly postgres connect -a yaci-pg -c "SELECT COUNT(*) FROM api.transactions_main;"
 
 # If raw has data but main is empty, check triggers exist
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   tgname as trigger_name,
   tgrelid::regclass as table_name,
@@ -1196,7 +1214,7 @@ ORDER BY tgrelid::regclass, tgname;
 **Resolution:**
 ```bash
 # If triggers missing, apply migration
-cat migrations/002_add_yaci_triggers.sql | fly postgres connect -a republic-yaci-pg
+cat migrations/002_add_yaci_triggers.sql | fly postgres connect -a yaci-pg
 
 # Backfill existing data
 npx tsx scripts/backfill-triggers.ts
@@ -1209,13 +1227,13 @@ npx tsx scripts/backfill-triggers.ts
 **Diagnosis:**
 ```bash
 # Check last indexed block
-fly postgres connect -a republic-yaci-pg -c "SELECT MAX(id) FROM api.blocks_raw;"
+fly postgres connect -a yaci-pg -c "SELECT MAX(id) FROM api.blocks_raw;"
 
 # Check indexer logs for errors
-fly logs -a republic-yaci-indexer | tail -100
+fly logs -a yaci-indexer | tail -100
 
 # Test gRPC connectivity from indexer
-fly ssh console -a republic-yaci-indexer
+fly ssh console -a yaci-indexer
 # Inside container:
 grpcurl -plaintext YOUR_GRPC_ENDPOINT:9090 list
 ```
@@ -1229,13 +1247,13 @@ grpcurl -plaintext YOUR_GRPC_ENDPOINT:9090 list
 **Resolution:**
 ```bash
 # Restart indexer
-fly machine restart <id> -a republic-yaci-indexer
+fly machine restart <id> -a yaci-indexer
 
 # If database issue, check disk space
-fly postgres connect -a republic-yaci-pg -c "SELECT pg_database_size('postgres');"
+fly postgres connect -a yaci-pg -c "SELECT pg_database_size('postgres');"
 
 # Check connection pool
-fly postgres connect -a republic-yaci-pg -c "SELECT count(*) FROM pg_stat_activity;"
+fly postgres connect -a yaci-pg -c "SELECT count(*) FROM pg_stat_activity;"
 ```
 
 ### EVM Transactions Not Decoding
@@ -1249,13 +1267,13 @@ fly status -a yaci-explorer-apis
 # Look for worker process with state=started
 
 # Check pending queue
-fly postgres connect -a republic-yaci-pg -c "SELECT COUNT(*) FROM api.evm_pending_decode;"
+fly postgres connect -a yaci-pg -c "SELECT COUNT(*) FROM api.evm_pending_decode;"
 
 # Check worker logs
 fly logs -a yaci-explorer-apis | grep -i worker
 
 # Check if EVM tables exist
-fly postgres connect -a republic-yaci-pg -c "\dt api.evm_*"
+fly postgres connect -a yaci-pg -c "\dt api.evm_*"
 ```
 
 **Common Causes:**
@@ -1289,10 +1307,10 @@ fly logs -a yaci-explorer-apis -i <worker-id>
 fly logs -a yaci-explorer-apis -i <app-id>
 
 # Test database connectivity
-fly postgres connect -a republic-yaci-pg -c "SELECT 1;"
+fly postgres connect -a yaci-pg -c "SELECT 1;"
 
 # Check role permissions
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   grantee,
   table_schema,
@@ -1315,7 +1333,7 @@ WHERE grantee = 'web_anon' AND table_schema = 'api';
 fly secrets list -a yaci-explorer-apis
 
 # Re-grant permissions
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 GRANT SELECT ON ALL TABLES IN SCHEMA api TO web_anon;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA api TO web_anon;
 "
@@ -1331,7 +1349,7 @@ fly machine restart <app-id> -a yaci-explorer-apis
 **Diagnosis:**
 ```bash
 # Check active queries
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   pid,
   usename,
@@ -1345,7 +1363,7 @@ ORDER BY query_start;
 "
 
 # Check slow queries
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   query,
   calls,
@@ -1358,7 +1376,7 @@ LIMIT 20;
 "
 
 # Check table bloat
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 SELECT
   schemaname,
   tablename,
@@ -1372,15 +1390,15 @@ ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
 **Resolution:**
 ```bash
 # Vacuum tables
-fly postgres connect -a republic-yaci-pg -c "VACUUM FULL ANALYZE api.transactions_raw;"
+fly postgres connect -a yaci-pg -c "VACUUM FULL ANALYZE api.transactions_raw;"
 
 # Add missing indexes
-fly postgres connect -a republic-yaci-pg -c "
+fly postgres connect -a yaci-pg -c "
 CREATE INDEX CONCURRENTLY idx_tx_timestamp ON api.transactions_main(timestamp DESC);
 "
 
 # Scale database if needed
-fly postgres update --vm-size shared-cpu-2x -a republic-yaci-pg
+fly postgres update --vm-size shared-cpu-2x -a yaci-pg
 ```
 
 ## Development Workflow
@@ -1389,9 +1407,9 @@ fly postgres update --vm-size shared-cpu-2x -a republic-yaci-pg
 
 ```bash
 # Clone all three repositories
-git clone https://github.com/dyphira-git/yaci.git
-git clone https://github.com/dyphira-git/yaci-explorer-apis.git
-git clone https://github.com/dyphira-git/yaci-explorer.git
+git clone https://github.com/Cordtus/yaci.git
+git clone https://github.com/Cordtus/yaci-explorer-apis.git
+git clone https://github.com/Cordtus/yaci-explorer.git
 
 # Start local PostgreSQL
 docker run -d \
@@ -1480,7 +1498,7 @@ COMMIT;
 EOF
 
 # Apply to production when ready
-cat migrations/004_new_feature.sql | fly postgres connect -a republic-yaci-pg
+cat migrations/004_new_feature.sql | fly postgres connect -a yaci-pg
 ```
 
 ## CI/CD Pipeline
@@ -1600,7 +1618,7 @@ FROM api.transactions_main t;
 **Vertical Scaling:**
 ```bash
 # Scale database
-fly postgres update --vm-size dedicated-cpu-1x -a republic-yaci-pg
+fly postgres update --vm-size dedicated-cpu-1x -a yaci-pg
 
 # Scale middleware
 fly scale vm shared-cpu-2x -a yaci-explorer-apis
@@ -1612,7 +1630,7 @@ fly scale vm shared-cpu-2x -a yaci-explorer-apis
 fly scale count 3 --process-group=app -a yaci-explorer-apis
 
 # Add read replicas (requires Fly Postgres HA)
-fly postgres attach --app yaci-explorer-apis republic-yaci-pg
+fly postgres attach --app yaci-explorer-apis yaci-pg
 ```
 
 **Partitioning Strategy (future):**
@@ -1694,7 +1712,7 @@ fly config show -a yaci-explorer-apis
 
 **Staging:**
 - Fly.io staging apps (yaci-explorer-staging)
-- Separate database (republic-yaci-pg-staging)
+- Separate database (yaci-pg-staging)
 - Connected to testnet
 
 **Production:**

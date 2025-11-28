@@ -23,18 +23,20 @@ We've consolidated the schema into a single migration and enhanced the decode wo
 
 ## Step 1: Reset Database
 
+Note: Replace `yaci-pg` with your actual Fly.io PostgreSQL app name.
+
 ### Option A: Fresh Start (Recommended)
 
 ```bash
 cd ~/repos/yaci-explorer-apis
 
 # Backup if needed
-fly postgres connect -a yaci-postgrest-db
+fly postgres connect -a yaci-pg
 \copy (SELECT * FROM api.transactions_main) TO 'backup.csv' CSV HEADER;
 \q
 
 # Drop and recreate database
-fly postgres connect -a yaci-postgrest-db
+fly postgres connect -a yaci-pg
 DROP SCHEMA api CASCADE;
 \q
 ```
@@ -42,7 +44,7 @@ DROP SCHEMA api CASCADE;
 ### Option B: Keep Yaci Running, Clear Middleware Tables
 
 ```bash
-fly postgres connect -a yaci-postgrest-db
+fly postgres connect -a yaci-pg
 DROP TABLE IF EXISTS api.evm_transactions CASCADE;
 DROP TABLE IF EXISTS api.evm_logs CASCADE;
 DROP TABLE IF EXISTS api.evm_tokens CASCADE;
@@ -82,16 +84,16 @@ yarn install
 
 ```bash
 # Get your DATABASE_URL
-fly postgres connect -a yaci-postgrest-db -c "SELECT current_database();"
+fly postgres connect -a yaci-pg -c "SELECT current_database();"
 
 # Set env var
 export DATABASE_URL="postgres://user:pass@host:5432/dbname"
 
 # Dry run first
-./scripts/migrate.sh --dry-run
+yarn migrate:dry
 
 # Apply
-./scripts/migrate.sh
+yarn migrate
 ```
 
 Expected output:
@@ -108,15 +110,16 @@ Migration complete!
 ### Verify Schema
 
 ```bash
-fly postgres connect -a yaci-postgrest-db
+fly postgres connect -a yaci-pg
 
 -- Check tables
 \dt api.*
 
 -- Should see:
 -- blocks_raw, transactions_raw, transactions_main
--- messages_raw, messages_main, events_main
+-- messages_raw, messages_main, events_raw, events_main
 -- evm_transactions, evm_logs, evm_tokens, evm_token_transfers, evm_contracts
+-- governance_proposals, governance_snapshots
 -- validators, proposals, proposal_votes, ibc_channels, denom_metadata
 
 -- Check views
@@ -124,8 +127,15 @@ fly postgres connect -a yaci-postgrest-db
 
 -- Should see:
 -- chain_stats, tx_volume_daily, tx_volume_hourly
--- message_type_stats, gas_usage_distribution, tx_success_rate
+-- message_type_stats, tx_success_rate
 -- fee_revenue, evm_tx_map, evm_pending_decode
+-- governance_active_proposals
+
+-- Check materialized views
+\dm api.*
+
+-- Should see:
+-- mv_daily_tx_stats, mv_hourly_tx_stats, mv_message_type_stats
 
 -- Check functions
 \df api.*
@@ -133,7 +143,8 @@ fly postgres connect -a yaci-postgrest-db
 -- Should see:
 -- universal_search, get_transaction_detail
 -- get_transactions_paginated, get_transactions_by_address
--- get_address_stats, get_block_time_analysis
+-- get_address_stats, get_governance_proposals
+-- refresh_analytics_views
 ```
 
 ---
@@ -164,7 +175,7 @@ Total decoded: 10 transactions
 ### Verify Decoding
 
 ```bash
-fly postgres connect -a yaci-postgrest-db
+fly postgres connect -a yaci-pg
 
 -- Check decoded transactions
 SELECT COUNT(*) FROM api.evm_transactions;
@@ -242,10 +253,10 @@ fly deploy
 
 ```bash
 # Get an EVM transaction hash from Yaci
-curl "https://yaci-postgrest.fly.dev/events_main?event_type=eq.ethereum_tx&limit=1" | jq -r '.[0].id'
+curl "https://yaci-explorer-apis.fly.dev/events_main?event_type=eq.ethereum_tx&limit=1" | jq -r '.[0].id'
 
 # Test transaction detail endpoint
-curl "https://yaci-postgrest.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_data'
+curl "https://yaci-explorer-apis.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_data'
 
 # Should return:
 # {
@@ -258,7 +269,7 @@ curl "https://yaci-postgrest.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>"
 # }
 
 # Check logs
-curl "https://yaci-postgrest.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_logs'
+curl "https://yaci-explorer-apis.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_logs'
 
 # Should return array of logs with topics
 ```
@@ -267,7 +278,7 @@ curl "https://yaci-postgrest.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>"
 
 ```bash
 # Search by EVM hash (0x prefix)
-curl "https://yaci-postgrest.fly.dev/rpc/universal_search?_query=0x8c5e4c1197a3176aaf2dcad45d4bf87d4a3afa03b10bd35a9f7079e3aabc18ac" | jq
+curl "https://yaci-explorer-apis.fly.dev/rpc/universal_search?_query=0x8c5e4c1197a3176aaf2dcad45d4bf87d4a3afa03b10bd35a9f7079e3aabc18ac" | jq
 
 # Should return:
 # [
@@ -346,7 +357,7 @@ yarn decode:evm 2>&1 | grep -i error
 
 This means `evm_data.hash` is missing. Check API response:
 ```bash
-curl "https://yaci-postgrest.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_data.hash'
+curl "https://yaci-explorer-apis.fly.dev/rpc/get_transaction_detail?_hash=<TX_HASH>" | jq '.evm_data.hash'
 ```
 
 Should return `"0x..."` not `null`.

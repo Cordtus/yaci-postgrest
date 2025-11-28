@@ -10,8 +10,10 @@ Blockchain -> YACI Indexer -> PostgreSQL -> PostgREST -> This Package -> Fronten
 
 This package provides:
 - SQL functions for optimized single-round-trip queries
-- Pre-aggregated analytics views
+- Pre-aggregated analytics views and materialized views
+- Background workers for EVM transaction decoding
 - TypeScript client for frontend consumption
+- Database triggers for governance tracking
 
 ## Components
 
@@ -26,10 +28,17 @@ Database functions and views that PostgREST exposes as RPC endpoints:
 - `universal_search()` - Cross-entity search
 
 Analytics views:
-- `chain_stats` - Overall chain statistics
+- `chain_stats` - Overall chain statistics (latest_block, total_transactions, unique_addresses, evm_transactions, active_validators)
 - `tx_volume_daily` - Daily transaction counts
+- `tx_volume_hourly` - Hourly transaction counts
 - `message_type_stats` - Message type distribution
 - `tx_success_rate` - Success/failure rates
+- `fee_revenue` - Fee totals by denomination
+
+Materialized views (refreshed via `api.refresh_analytics_views()`):
+- `mv_daily_tx_stats` - Daily stats with unique senders
+- `mv_hourly_tx_stats` - Hourly stats for last 7 days
+- `mv_message_type_stats` - Message type percentages
 
 ### Client Package (`/packages/client`)
 
@@ -85,13 +94,18 @@ yarn migrate:dry
 
 ## Deployment
 
-Deployed to Fly.io as a PostgREST container:
+Deployed to Fly.io with three processes:
+- `app` - PostgREST API server (port 3000)
+- `worker` - EVM decode daemon (continuous batch processing)
+- `priority_decoder` - Priority EVM decode via NOTIFY/LISTEN
 
 ```bash
 fly deploy
 ```
 
-Configuration in `fly.toml`. Requires `PGRST_DB_URI` secret set in Fly.
+Configuration in `fly.toml`. Required secrets:
+- `PGRST_DB_URI` - PostgREST connection string
+- `DATABASE_URL` - Worker connection string
 
 ## Frontend Integration
 
